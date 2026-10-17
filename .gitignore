@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.linegen-cache/
+out/
+out_live/
+_qa/
+_tmp_out/
