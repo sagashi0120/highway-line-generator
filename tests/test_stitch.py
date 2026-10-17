@@ -77,6 +77,16 @@ class StitchTest(unittest.TestCase):
         self.assertGreater(len(res.points), 2)
         self.assertTrue(any("離れています" in w for w in res.warnings))
 
+    def test_long_road_midpoint_follows_down_direction(self):
+        # 東京から離れる向き（東→西）が下り。途中地点でも西（下り）へ進むこと。
+        down1 = make_way(1, (1, 2), ((35.0, 139.2), (35.0, 139.1)))
+        down2 = make_way(2, (2, 3), ((35.0, 139.1), (35.0, 139.0)))
+        up1 = make_way(3, (11, 12), ((35.0002, 139.0), (35.0002, 139.1)))
+        up2 = make_way(4, (12, 13), ((35.0002, 139.1), (35.0002, 139.2)))
+        res = stitch.build_line([down1, down2, up1, up2], (35.0001, 139.1))
+        self.assertAlmostEqual(res.end[1], 139.0, places=4)
+        self.assertEqual(res.way_ids, [1, 2])
+
     def test_gap_is_bridged(self):
         w1 = make_way(1, (1, 2), ((35.0, 139.0), (35.0, 139.01)))
         w2 = make_way(2, (3, 4), ((35.0, 139.012), (35.0, 139.02)))

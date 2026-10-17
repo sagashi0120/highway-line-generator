@@ -79,6 +79,37 @@ class CoreTest(unittest.TestCase):
         self.assertFalse(fuzzy)
         self.assertEqual(sum(1 for w in ways if w.primary), 1)
 
+    def test_long_tunnel_named_way_is_connector(self):
+        info = core.resolve_road("テスト高速道路", "T1", HERE)
+        opts = core.GenerateOptions(base_dir=HERE, quiet=True)
+        raw = [
+            make_road_way(1, 139.0, 139.01),
+            {
+                "id": 2,
+                "nodes": [3, 4],
+                "coords": [(35.0, 139.01), (35.0, 139.025)],
+                "tags": {
+                    "highway": "motorway",
+                    "name": "引佐トンネル",
+                    "ref": "T1",
+                    "oneway": "yes",
+                },
+            },
+        ]
+        ways, n_primary, n_connector, _ = core.classify_ways(raw, info, opts)
+        self.assertEqual(n_primary, 1)
+        self.assertEqual(n_connector, 1)
+        self.assertFalse(ways[1].primary)
+
+    def test_merge_prefers_target_road_name(self):
+        info = core.resolve_road("テスト高速道路", "T1", HERE)
+        raw = {}
+        old = make_road_way(1, 139.0, 139.01, name="引佐トンネル")
+        new = make_road_way(1, 139.0, 139.01)
+        core._merge_way(raw, old, info)
+        core._merge_way(raw, new, info)
+        self.assertEqual(raw[1]["tags"]["name"], "テスト高速道路")
+
     def test_bbox_expansion_fetches_whole_road(self):
         road = fake_road_ways()
         calls = []

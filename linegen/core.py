@@ -11,6 +11,7 @@ from . import geo, overpass, roads, stitch
 Coord = Tuple[float, float]
 
 ROAD_LIKE_TOKENS = ("高速道路", "自動車道", "道路", "国道", "有料道路", "バイパス")
+STRUCTURE_TOKENS = ("橋", "トンネル", "隧道", "高架", "覆道", "シェルター", "洞")
 
 
 @dataclass
@@ -20,6 +21,7 @@ class GenerateOptions:
     directions: str = "both"  # "both" / "down" / "up"
     include_links: bool = False
     connector_max_m: float = 500.0
+    connector_structure_max_m: float = 8000.0
     simplify_m: float = 15.0
     gap_m: float = 500.0
     initial_radius_deg: float = 0.15
@@ -129,6 +131,10 @@ def _is_road_like_name(name: str) -> bool:
     return any(token in name for token in ROAD_LIKE_TOKENS)
 
 
+def _is_structure_name(name: str) -> bool:
+    return any(token in name for token in STRUCTURE_TOKENS)
+
+
 def classify_ways(raw_ways, info: RoadInfo, opts: GenerateOptions):
     """対象道路のウェイ（primary）と、短い橋などの接続ウェイ（connector）に分ける。"""
     dedup: Dict[int, dict] = {}
@@ -158,14 +164,21 @@ def classify_ways(raw_ways, info: RoadInfo, opts: GenerateOptions):
             continue
         tags = way["tags"]
         length = geo.polyline_length_m(way["coords"])
-        if length > opts.connector_max_m:
-            continue
         name = tags.get("name") or ""
-        if name and _is_road_like_name(name):
-            continue
         highway = tags.get("highway") or ""
         is_link = highway.endswith("_link")
         ref_ok = bool(info.codes) and roads.ref_matches(tags, info.codes)
+        if length > opts.connector_max_m:
+            # 橋・トンネルなど、構造物名になっている同路線のウェイは長くても接続扱い
+            if not (
+                ref_ok
+                and name
+                and _is_structure_name(name)
+                and length <= opts.connector_structure_max_m
+            ):
+                continue
+        if name and _is_road_like_name(name):
+            continue
         if ref_ok or (is_link and opts.include_links):
             connector_raw.append(way)
 
@@ -214,6 +227,26 @@ def _collect_names(primary_raw) -> List[str]:
             if value and value not in names:
                 names.append(value)
     return names[:24]
+
+
+def _merge_way(raw: Dict[int, dict], way: dict, info: RoadInfo) -> None:
+    """同じウェイの重複レスポンスを統合する。
+
+    Overpass のミラーによってタグが古い/新しいことがあるため、
+    対象道路名に一致する方を優先する。
+    """
+    existing = raw.get(way["id"])
+    if existing is None:
+        raw[way["id"]] = way
+        return
+    new_primary = roads.name_matches(way["tags"], [info.name])
+    old_primary = roads.name_matches(existing["tags"], [info.name])
+    if new_primary and not old_primary:
+        raw[way["id"]] = way
+    elif old_primary and not new_primary:
+        return
+    else:
+        raw[way["id"]] = way
 
 
 def _fetch(bbox, names, codes, opts: GenerateOptions, *, regex=None, include_links=False):
@@ -303,7 +336,7 @@ def fetch_road_ways(info: RoadInfo, start: Coord, opts: GenerateOptions):
         )
         datas.append(data)
         for way in ways:
-            raw[way["id"]] = way
+            _merge_way(raw, way, info)
         primary = _matched_ways(raw, info, fuzzy=False)
         if primary:
             break
@@ -357,7 +390,7 @@ def fetch_road_ways(info: RoadInfo, start: Coord, opts: GenerateOptions):
         )
         datas.append(data)
         for way in ways:
-            raw[way["id"]] = way
+            _merge_way(raw, way, info)
         fetch_bbox = new_bbox
         log(
             "  取得範囲を拡張: %.2f,%.2f,%.2f,%.2f（%s）"
@@ -456,6 +489,13 @@ def generate(road_input: str, start: Coord, code: Optional[str] = None, opts: Op
             "作成したラインの端点付近に未使用の道路データがあります（%s）。"
             "--gap を大きくするか --bbox を指定してください。" % unused_near
         )
+    else:
+        unused_far = _find_unused_near(down_result, down_ways, threshold_m=30000.0)
+        if unused_far:
+            down_warnings.append(
+                "道路データが別区間に分かれています（%s）。"
+                "未開通区間や道路名の変化がないか確認してください。" % unused_far
+            )
     down_line = DirectionalLine(
         direction="down",
         points=down_result.points,

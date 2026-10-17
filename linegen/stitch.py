@@ -73,6 +73,9 @@ class BuildOptions:
     loop_guard_m: float = 150.0
     terminus_ambiguity_m: float = 120.0
     warn_terminus_ambiguity: bool = True
+    direction_from_road: bool = True
+    direction_from_road_min_length_m: float = 10000.0
+    end_point_threshold_m: float = 500.0
 
 
 @dataclass
@@ -267,6 +270,59 @@ def _node_distance(graph: _Graph, node: int, point: Coord) -> float:
     return geo.haversine_m(point[0], point[1], coord[0], coord[1])
 
 
+TOKYO = (35.681236, 139.767125)
+
+
+def _estimate_road_ends(graph: _Graph, min_length_m: float = 0.0):
+    """道路全体の両端を推定し、(下り始点, 下り終点) を返す。
+
+    指定地点が道路の途中でも下り方向を決められるようにするため、
+    端点のうち東京に近い側を下り始点とみなす（多くの高速道路の convention）。
+    確実でない場合は None を返し、従来の「指定地点に近い始点」にフォールバックする。
+    """
+    # 上下線が並行する道路で「斜めの組合せ」を端点と誤認しないよう、
+    # 最も長い主成分の端点だけを使う。
+    main_comp = None
+    main_len = -1.0
+    for comp in graph.components:
+        length = sum(graph.ways[idx].length_m for idx in comp)
+        if length > main_len and len(graph.component_endpoints(comp)) >= 2:
+            main_comp = comp
+            main_len = length
+    terminals = []
+    if main_len < min_length_m:
+        return None
+    if main_comp is not None:
+        for node in graph.component_endpoints(main_comp):
+            coord = graph.node_coord(node)
+            if coord is not None:
+                terminals.append(coord)
+    if len(terminals) < 2:
+        for comp in graph.components:
+            for node in graph.component_endpoints(comp):
+                coord = graph.node_coord(node)
+                if coord is not None:
+                    terminals.append(coord)
+    if len(terminals) < 2:
+        return None
+    lat0 = sum(c[0] for c in terminals) / len(terminals)
+    lng0 = sum(c[1] for c in terminals) / len(terminals)
+
+    def farthest(coord):
+        return max(
+            terminals,
+            key=lambda c: geo.haversine_m(coord[0], coord[1], c[0], c[1]),
+        )
+
+    a = farthest((lat0, lng0))
+    b = farthest(a)
+    if a == b or geo.haversine_m(a[0], a[1], b[0], b[1]) < 1000.0:
+        return None
+    da = geo.haversine_m(a[0], a[1], TOKYO[0], TOKYO[1])
+    db = geo.haversine_m(b[0], b[1], TOKYO[0], TOKYO[1])
+    return (a, b) if da <= db else (b, a)
+
+
 def _terminus_ambiguity(graph: _Graph, comp, head_coord, point, opts: BuildOptions) -> bool:
     """指定地点が道路の端点にあり、下り/上りの判定が曖昧か。"""
     if geo.haversine_m(point[0], point[1], head_coord[0], head_coord[1]) > opts.terminus_ambiguity_m:
@@ -311,7 +367,14 @@ def _choose_start(graph: _Graph, point: Coord, opts: BuildOptions) -> _StartChoi
     if not candidates:
         candidates = comp_nearest[:2]
 
-    scored = []
+    down_end = None
+    if opts.direction_from_road and not opts.reverse:
+        ends = _estimate_road_ends(graph, opts.direction_from_road_min_length_m)
+        if ends is not None:
+            down_end = ends[1]
+
+    all_scored = []
+    down_scored = []
     for comp_dist, comp, near in candidates:
         endpoints = graph.component_endpoints(comp)
         heads = [n for n in endpoints if graph.is_head(comp, n)]
@@ -327,8 +390,32 @@ def _choose_start(graph: _Graph, point: Coord, opts: BuildOptions) -> _StartChoi
         head_dist = geo.haversine_m(point[0], point[1], head_coord[0], head_coord[1])
         tails = [n for n in endpoints if graph.is_tail(comp, n)]
         tail_dist = min((_node_distance(graph, n, point) for n in tails), default=float("inf"))
-        scored.append((head_dist, comp_dist, comp, head, head_coord, tail_dist < head_dist))
 
+        eligible = True
+        if down_end is not None and tails:
+            tail_near = min(tails, key=lambda n: _node_distance(graph, n, point))
+            if _node_distance(graph, tail_near, point) <= opts.end_point_threshold_m:
+                # 指定地点が下り線の終点付近 → 従来どおり端点からの生成に任せる
+                eligible = False
+            else:
+                tail_coord = graph.node_coord(tail_near)
+                if tail_coord is not None:
+                    d_tail = geo.haversine_m(
+                        tail_coord[0], tail_coord[1], down_end[0], down_end[1]
+                    )
+                    d_head = geo.haversine_m(
+                        head_coord[0], head_coord[1], down_end[0], down_end[1]
+                    )
+                    # 進行方向（head→tail）が下り終点へ向かう成分だけを下り線とする
+                    eligible = d_tail < d_head
+
+        near_tail = tail_dist <= opts.end_point_threshold_m
+        item = (head_dist, comp_dist, comp, head, head_coord, near_tail)
+        all_scored.append(item)
+        if eligible:
+            down_scored.append(item)
+
+    scored = down_scored or all_scored
     if not scored:
         raise StitchError("道路の始点を特定できませんでした")
 
