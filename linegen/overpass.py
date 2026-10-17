@@ -51,6 +51,15 @@ def _regex_quote(value: str) -> str:
     return "".join((chr(92) + ch) if ch in special else ch for ch in value)
 
 
+def normalize_bboxes(bbox):
+    """単一bbox / bboxのリストを、bboxのリストに正規化する。"""
+    if not bbox:
+        raise ValueError("bbox が空です")
+    if isinstance(bbox[0], (int, float)):
+        return [tuple(float(v) for v in bbox)]
+    return [tuple(float(v) for v in b) for b in bbox]
+
+
 def build_query(
     bbox,
     names=None,
@@ -61,34 +70,37 @@ def build_query(
 ) -> str:
     """Overpass QL のクエリ文字列を組み立てる。
 
-    bbox は (south, west, north, east)。names は完全一致、
-    name_regex は部分一致（正規表現）で名前を探す。
+    bbox は (south, west, north, east) もしくはそのリスト。
+    複数指定時は、それぞれの範囲をまとめて1クエリで取得する。
+    names は完全一致、name_regex は部分一致（正規表現）で名前を探す。
     refs は道路コード（例: E1）の完全一致。
     """
-    bbox_str = "%.6f,%.6f,%.6f,%.6f" % tuple(bbox)
+    bboxes = normalize_bboxes(bbox)
+    bbox_strs = ["%.6f,%.6f,%.6f,%.6f" % b for b in bboxes]
     highways = list(MAIN_HIGHWAYS)
     if include_links:
         highways.extend(LINK_HIGHWAYS)
     hw_regex = "^(%s)$" % "|".join(re.escape(h) for h in highways)
 
     clauses = []
-    for name in names or ():
-        clauses.append(
-            'way["highway"~"%s"]["name"="%s"](%s);' % (hw_regex, _overpass_quote(name), bbox_str)
-        )
-        clauses.append(
-            'way["highway"~"%s"]["official_name"="%s"](%s);'
-            % (hw_regex, _overpass_quote(name), bbox_str)
-        )
-    for ref in refs or ():
-        clauses.append(
-            'way["highway"~"%s"]["ref"="%s"](%s);' % (hw_regex, _overpass_quote(ref), bbox_str)
-        )
-    if name_regex:
-        clauses.append(
-            'way["highway"~"%s"]["name"~"%s"](%s);'
-            % (hw_regex, _regex_quote(name_regex), bbox_str)
-        )
+    for bbox_str in bbox_strs:
+        for name in names or ():
+            clauses.append(
+                'way["highway"~"%s"]["name"="%s"](%s);' % (hw_regex, _overpass_quote(name), bbox_str)
+            )
+            clauses.append(
+                'way["highway"~"%s"]["official_name"="%s"](%s);'
+                % (hw_regex, _overpass_quote(name), bbox_str)
+            )
+        for ref in refs or ():
+            clauses.append(
+                'way["highway"~"%s"]["ref"="%s"](%s);' % (hw_regex, _overpass_quote(ref), bbox_str)
+            )
+        if name_regex:
+            clauses.append(
+                'way["highway"~"%s"]["name"~"%s"](%s);'
+                % (hw_regex, _regex_quote(name_regex), bbox_str)
+            )
     if not clauses:
         raise ValueError("names / refs / name_regex のいずれかが必要です")
 

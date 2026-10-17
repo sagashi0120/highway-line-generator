@@ -23,6 +23,14 @@ class OverpassTest(unittest.TestCase):
         self.assertIn("out body geom;", q)
         self.assertIn("motorway", q)
 
+    def test_build_query_multiple_bboxes(self):
+        q = overpass.build_query(
+            [(35.0, 139.0, 35.1, 139.1), (35.1, 139.0, 35.2, 139.1)],
+            names=["テスト道路"],
+        )
+        self.assertIn("35.000000,139.000000,35.100000,139.100000", q)
+        self.assertIn("35.100000,139.000000,35.200000,139.100000", q)
+
     def test_regex_escape(self):
         self.assertEqual(overpass._regex_quote("中央自動車道(富士吉田線)"), "中央自動車道\\(富士吉田線\\)")
 

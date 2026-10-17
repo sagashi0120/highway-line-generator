@@ -24,8 +24,11 @@ class GenerateOptions:
     gap_m: float = 500.0
     initial_radius_deg: float = 0.15
     search_radius_deg: float = 0.9
-    max_expand: int = 9
+    max_expand: int = 12
     max_bbox_deg: float = 14.0
+    edge_margin_deg: float = 0.05
+    expand_step_min_deg: float = 0.15
+    expand_step_max_deg: float = 0.8
     bbox: Optional[Tuple[float, float, float, float]] = None
     source_json: Optional[str] = None
     cache_dir: str = ".linegen-cache"
@@ -228,8 +231,55 @@ def _fetch(bbox, names, codes, opts: GenerateOptions, *, regex=None, include_lin
     return ways, data
 
 
+def _clipped_sides(data_bbox, fetch_bbox, edge_margin_deg: float):
+    """データの端が取得範囲の端に接している方向（=道路がまだ先に続く可能性）を返す。"""
+    sides = []
+    if data_bbox[0] - fetch_bbox[0] <= edge_margin_deg:
+        sides.append("south")
+    if data_bbox[1] - fetch_bbox[1] <= edge_margin_deg:
+        sides.append("west")
+    if fetch_bbox[2] - data_bbox[2] <= edge_margin_deg:
+        sides.append("north")
+    if fetch_bbox[3] - data_bbox[3] <= edge_margin_deg:
+        sides.append("east")
+    return sides
+
+
+def _expand_sides(bbox, sides, step_deg: float):
+    south, west, north, east = bbox
+    if "south" in sides:
+        south -= step_deg
+    if "west" in sides:
+        west -= step_deg
+    if "north" in sides:
+        north += step_deg
+    if "east" in sides:
+        east += step_deg
+    return (south, west, north, east)
+
+
+def _fringe_rects(old_bbox, new_bbox):
+    """拡張前後の差分（新しく取得すべき外側の帯）を矩形のリストで返す。"""
+    s0, w0, n0, e0 = old_bbox
+    s1, w1, n1, e1 = new_bbox
+    rects = []
+    if s1 < s0:
+        rects.append((s1, w1, s0, e1))
+    if n1 > n0:
+        rects.append((n0, w1, n1, e1))
+    if w1 < w0:
+        rects.append((max(s0, s1), w1, min(n0, n1), w0))
+    if e1 > e0:
+        rects.append((max(s0, s1), e0, min(n0, n1), e1))
+    return rects
+
+
 def fetch_road_ways(info: RoadInfo, start: Coord, opts: GenerateOptions):
-    """対象道路のウェイを、指定地点から bbox を広げながら取得する。"""
+    """対象道路のウェイを、指定地点から bbox を広げながら取得する。
+
+    道路が実際に伸びている方向だけを、少しずつ広げる。
+    道路全体が取得範囲に収まったら、あまり余計に広げずに終了する。
+    """
     canonical = roads.canonical_name(info.name)
     names = list(dict.fromkeys([info.name, canonical]))
 
@@ -239,7 +289,7 @@ def fetch_road_ways(info: RoadInfo, start: Coord, opts: GenerateOptions):
             fetch_bbox, names, info.codes, opts,
             regex=canonical, include_links=opts.include_links,
         )
-        return ways, fetch_bbox, [data]
+        return ways, fetch_bbox, [data], False
 
     radius = opts.initial_radius_deg
     raw: Dict[int, dict] = {}
@@ -270,12 +320,12 @@ def fetch_road_ways(info: RoadInfo, start: Coord, opts: GenerateOptions):
         fetch_bbox = geo.bbox_around(start[0], start[1], radius)
         log("  道路を広範囲から探しています（半径 %.2f 度）" % radius, opts.quiet)
 
-    # 実際の OSM の名前を集めて、以降は完全一致で取得する
+    # 実際の OSM の名前を集めて、以降は完全一致も併用して取得する
     primary_names = _collect_names(primary)
     exact_names = list(dict.fromkeys(primary_names + [info.name, canonical]))
     regex = canonical
 
-    previous_bbox = None
+    truncated = False
     for iteration in range(opts.max_expand):
         # 取得範囲の判定には「対象道路のウェイ」だけを使う。
         # 同じ ref を共有する別路線（例: E1 の東名と名神）で範囲が膨らむのを防ぐ。
@@ -283,41 +333,55 @@ def fetch_road_ways(info: RoadInfo, start: Coord, opts: GenerateOptions):
         data_bbox = _bbox_of_ways(primary_now)
         if data_bbox is None:
             break
-        span = max(data_bbox[2] - data_bbox[0], data_bbox[3] - data_bbox[1])
-        margin = max(0.08, span * 0.45)
-        desired = geo.bbox_expand(data_bbox, margin)
-        if geo.bbox_contains(fetch_bbox, desired):
+        clipped = _clipped_sides(data_bbox, fetch_bbox, opts.edge_margin_deg)
+        if not clipped:
             log("  取得範囲は道路全体をカバーしています", opts.quiet)
             break
-        if previous_bbox is not None and desired == previous_bbox:
-            break
-        new_bbox = geo.bbox_union(fetch_bbox, desired)
+        span = max(data_bbox[2] - data_bbox[0], data_bbox[3] - data_bbox[1])
+        step = max(
+            opts.expand_step_min_deg,
+            min(opts.expand_step_max_deg, span * 0.5),
+        )
+        new_bbox = _expand_sides(fetch_bbox, clipped, step)
         if (
             new_bbox[2] - new_bbox[0] > opts.max_bbox_deg
             or new_bbox[3] - new_bbox[1] > opts.max_bbox_deg
         ):
+            truncated = True
             break
         before = len(primary_now)
+        fringe = _fringe_rects(fetch_bbox, new_bbox)
         ways, data = _fetch(
-            new_bbox, exact_names, info.codes, opts,
+            fringe, exact_names, info.codes, opts,
             regex=regex, include_links=opts.include_links,
         )
         datas.append(data)
         for way in ways:
             raw[way["id"]] = way
+        fetch_bbox = new_bbox
         log(
-            "  取得範囲を拡張: %.2f,%.2f,%.2f,%.2f"
-            % new_bbox,
+            "  取得範囲を拡張: %.2f,%.2f,%.2f,%.2f（%s）"
+            % (new_bbox + (",".join(clipped),)),
             opts.quiet,
         )
-        fetch_bbox = new_bbox
-        previous_bbox = desired
         primary_after = _matched_ways(raw, info, fuzzy=fuzzy_mode)
         if len(primary_after) == before:
-            # 対象道路のウェイが増えないなら、道路はここで終わりとみなす
+            # 広げた範囲に新しい道路がなければ、道路はここで終わり
             break
+    else:
+        truncated = True
 
-    return list(raw.values()), fetch_bbox, datas
+    primary_final = _matched_ways(raw, info, fuzzy=fuzzy_mode)
+    data_bbox = _bbox_of_ways(primary_final)
+    if data_bbox is not None and _clipped_sides(data_bbox, fetch_bbox, opts.edge_margin_deg):
+        truncated = True
+
+    log(
+        "  取得範囲: %.2f,%.2f,%.2f,%.2f（OSM取得 %d 回）"
+        % (fetch_bbox + (len(datas),)),
+        opts.quiet,
+    )
+    return list(raw.values()), fetch_bbox, datas, truncated
 
 
 def _matched_ways(raw: Dict[int, dict], info: RoadInfo, fuzzy: bool = False):
@@ -340,6 +404,7 @@ def generate(road_input: str, start: Coord, code: Optional[str] = None, opts: Op
     log("OSM データを取得しています...", opts.quiet)
 
     source_note = None
+    truncated = False
     if opts.source_json:
         raw_ways, data = _load_osm_json(opts.source_json)
         fetcher_bbox = _bbox_of_ways(raw_ways) or (0.0, 0.0, 0.0, 0.0)
@@ -347,7 +412,7 @@ def generate(road_input: str, start: Coord, code: Optional[str] = None, opts: Op
         datas = [data]
         source_note = "--osm-json の保存データを使用しました"
     else:
-        raw_ways, fetch_bbox, datas = fetch_road_ways(info, start, opts)
+        raw_ways, fetch_bbox, datas, truncated = fetch_road_ways(info, start, opts)
     ways, primary_count, connector_count, fuzzy_used = classify_ways(raw_ways, info, opts)
 
     warnings: List[str] = []
@@ -363,6 +428,11 @@ def generate(road_input: str, start: Coord, code: Optional[str] = None, opts: Op
         )
     if connector_count:
         warnings.append("短い接続ウェイ（橋など）を %d 本使用しました。" % connector_count)
+    if truncated:
+        warnings.append(
+            "取得範囲の端に達した可能性があります。"
+            "--bbox で範囲を指定するか、--max-expand を増やしてください。"
+        )
     if not info.codes:
         warnings.append(
             "道路コードが不明です。橋・トンネルなど名称の異なる区間が欠ける場合があります（--code を指定してください）。"

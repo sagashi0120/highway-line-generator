@@ -104,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", help="出力形式 lineData,geojson,csv のカンマ区切り（既定: lineData）")
     parser.add_argument("--simplify", type=float, default=10.0, metavar="メートル", help="間引き許容誤差（既定: 10m、0で無効）")
     parser.add_argument("--gap", type=float, default=500.0, metavar="メートル", help="道路データの途切れを補う最大距離（既定: 500m）")
+    parser.add_argument("--max-expand", type=int, default=12, metavar="回数", help="OSM取得範囲の自動拡張の最大回数（既定: 12）")
     parser.add_argument("--connector-max", type=float, default=500.0, metavar="メートル", help="橋などの接続ウェイとして使う最大長（既定: 500m）")
     parser.add_argument("--include-links", action="store_true", help="立体交差のリンク道路も取得対象にする")
     parser.add_argument("--bbox", help="取得範囲 南,西,北,東（例: 34.6,136.8,35.8,139.8）")
@@ -150,6 +151,7 @@ def main(argv=None) -> int:
         connector_max_m=args.connector_max,
         simplify_m=args.simplify,
         gap_m=args.gap,
+        max_expand=args.max_expand,
         bbox=bbox,
         source_json=args.osm_json,
         cache_dir=cache_dir,
